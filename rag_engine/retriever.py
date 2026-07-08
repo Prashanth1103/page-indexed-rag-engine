@@ -1,7 +1,8 @@
 import asyncio
-from typing import Callable, List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
+from rag_engine.llm_client import StatelessGPT4oClient
 from rag_engine.memoization import StageMemoCache
-from rag_engine.schemas import CitedAssertion, DocumentIndex, ResearchReport, SectionIndex
+from rag_engine.schemas import DocumentIndex, ResearchReport, SectionIndex
 from rag_engine.telemetry import telemetry
 
 
@@ -10,33 +11,41 @@ class IntentRecursivePlanner:
 
     REQUIRED_DIMENSIONS = ("pricing_assumptions", "volume_drivers", "margin_impact")
 
+    def __init__(self, llm_client: Optional[StatelessGPT4oClient] = None) -> None:
+        self.llm = llm_client or StatelessGPT4oClient()
+
     @telemetry(span_name="planner.decompose_query", layer="agent")
     def decompose(self, query: str) -> List[str]:
         tokens = {t.lower().strip("?,.:;") for t in query.split() if len(t) > 2}
         if len(tokens) >= 5:
             return [query.strip()]
-        # Vague query guardrail: expand across core commercial dimensions
         return [f"{query.strip()} — focus: {dim}" for dim in self.REQUIRED_DIMENSIONS]
+
+    @telemetry(span_name="planner.decompose_query_async", layer="agent")
+    async def decompose_async(self, query: str) -> List[str]:
+        return await self.llm.decompose_query(query, self.REQUIRED_DIMENSIONS)
 
 
 class HierarchicalPageRetriever:
     """
     4-Stage Page-Indexed Retrieval Pipeline:
       Stage 1: Lexical JSON keyword pre-filtering across document metadata.
-      Stage 2: Async document-summary relevancy scoring for unmatched candidates.
-      Stage 3: Async section & table-summary relevancy scoring with page tracking.
-      Stage 4: Evidence consolidation with verifiable page citations.
+      Stage 2: Async GPT-4o document-summary relevancy scoring for unmatched candidates.
+      Stage 3: Async GPT-4o section & table-summary relevancy scoring with page tracking.
+      Stage 4: Evidence consolidation with verifiable page citations via GPT-4o Structured Outputs.
     """
 
     def __init__(
         self,
         corpus: Sequence[DocumentIndex],
         cache: StageMemoCache | None = None,
+        llm_client: StatelessGPT4oClient | None = None,
         concurrency_limit: int = 8,
     ) -> None:
         self.corpus = list(corpus)
         self.cache = cache or StageMemoCache()
-        self.planner = IntentRecursivePlanner()
+        self.llm = llm_client or StatelessGPT4oClient()
+        self.planner = IntentRecursivePlanner(llm_client=self.llm)
         self._sem = asyncio.Semaphore(concurrency_limit)
 
     @telemetry(span_name="stage1.lexical_prefilter", layer="retriever")
@@ -59,11 +68,7 @@ class HierarchicalPageRetriever:
             return float(cached)
 
         async with self._sem:
-            await asyncio.sleep(0.002)
-            q_terms = {w.lower().strip("?,.:;") for w in query.split() if len(w) > 2}
-            s_terms = {w.lower().strip("?,.:;") for w in doc.doc_summary.split()}
-            overlap = len(q_terms & s_terms) / max(len(q_terms), 1)
-            score = round(min(1.0, overlap * 1.5), 4)
+            score = await self.llm.score_summary(query, doc.title, doc.doc_summary)
             self.cache.set("doc_score", payload, score)
             return score
 
@@ -75,14 +80,8 @@ class HierarchicalPageRetriever:
             return float(cached), section, doc_id
 
         async with self._sem:
-            await asyncio.sleep(0.002)
-            q_terms = {w.lower().strip("?,.:;") for w in query.split() if len(w) > 2}
-            sec_terms = {
-                w.lower().strip("?,.:;")
-                for w in (section.summary + " " + " ".join(section.keywords)).split()
-            }
-            overlap = len(q_terms & sec_terms) / max(len(q_terms), 1)
-            score = round(min(1.0, overlap * 1.8), 4)
+            summary_input = f"{section.summary} Keywords: {' '.join(section.keywords)}"
+            score = await self.llm.score_summary(query, section.heading, summary_input)
             self.cache.set("sec_score", payload, score)
             return score, section, doc_id
 
@@ -94,7 +93,7 @@ class HierarchicalPageRetriever:
         section_threshold: float = 0.20,
         top_k: int = 5,
     ) -> ResearchReport:
-        subqueries = self.planner.decompose(query)
+        subqueries = await self.planner.decompose_async(query)
         candidate_docs_map = {}
 
         for sq in subqueries:
@@ -123,21 +122,9 @@ class HierarchicalPageRetriever:
                     best_by_sec[key] = (sc, sec, doc_id)
 
         ranked = sorted(best_by_sec.values(), key=lambda x: x[0], reverse=True)[:top_k]
-        citations = [
-            CitedAssertion(
-                statement=sec.raw_content,
-                doc_id=doc_id,
-                page_number=sec.page_number,
-                section_id=sec.section_id,
-                relevance_score=sc,
-            )
-            for sc, sec, doc_id in ranked
-        ]
-        summary = " | ".join(f"[{c.doc_id}:p.{c.page_number}] {c.statement}" for c in citations)
-        return ResearchReport(
+        return await self.llm.synthesize_with_citations(
             query=query,
-            decomposed_subqueries=subqueries,
-            answer_summary=summary or "No grounded evidence met citation threshold.",
-            citations=citations,
+            subqueries=subqueries,
+            ranked_sections=ranked,
             cache_hits=self.cache.hits,
         )
